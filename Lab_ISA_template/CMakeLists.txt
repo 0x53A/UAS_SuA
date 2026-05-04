@@ -44,12 +44,16 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user sources here
+    Middlewares/RTT/RTT/SEGGER_RTT.c
+    Middlewares/RTT/RTT/SEGGER_RTT_printf.c
+    Middlewares/RTT/RTT/SEGGER_RTT_ASM_ARMv7M.S
+    Middlewares/RTT/Syscalls/SEGGER_RTT_Syscalls_GCC.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user defined include paths
+    Middlewares/RTT/RTT
+    Middlewares/RTT/Config
 )
 
 # Add project symbols (macros)

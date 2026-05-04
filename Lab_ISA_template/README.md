@@ -23,3 +23,9 @@ cmake --build build/Debug
 The output ELF is at `build/Debug/Lab_ISA_template.elf`.
 
 For a release build, replace `Debug` with `Release`.
+
+## Flash (and monitor)
+
+```sh
+probe-rs run --chip STM32G431KB --connect-under-reset build/Debug/Lab_ISA_template.elf
+```

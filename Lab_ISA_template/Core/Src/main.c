@@ -34,6 +34,7 @@
 #include "math.h"		// for use of standard math functions
 #include "stdlib.h"		// for use of abs() function
 #include "stdbool.h"	// for use of true/false states
+#include "SEGGER_RTT.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,8 +44,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-//check values
 
+#define RAD_TO_DEG (180.0f / M_PI)
 
 /* USER CODE END PD */
 
@@ -66,21 +67,51 @@ TIM_HandleTypeDef htim17;
 
 /* USER CODE BEGIN PV */
 /*VARIABLES******************************************************************/
-struct ADC_Values {									// ADC output values
+struct ADC_Values {
 	uint16_t SIN1;
 	uint16_t COS1;
 	uint16_t VDIAG1;
 };
-struct XY_Values {									// X & Y raw values of both channels
+struct AMR_MinMax {
+	uint16_t sin_min;
+	uint16_t sin_max;
+	uint16_t cos_min;
+	uint16_t cos_max;
+};
+struct AMR_CalibParams {
+	float sin_offset;
+	float sin_amplitude;
+	float cos_offset;
+	float cos_amplitude;
+};
+
+struct AMR_Normalized {
+	float sin;
+	float cos;
+};
+struct XY_Values {
 	float Y1;
 	float X1;
 };
 
 /* Global variables************************************************************/
-// AMR-related quantities
-struct ADC_Values ADCresult;						// contains DMA ADC result
-struct XY_Values XYresult;							// contains transformed XYvalues
-uint16_t adcVal[8];									// output of ADC measurement
+uint16_t adcVal[8];
+struct ADC_Values ADCresult;
+struct XY_Values XYresult;
+
+struct AMR_MinMax amr_minmax = {
+  .sin_min = UINT16_MAX,
+  .sin_max = 0,
+  .cos_min = UINT16_MAX,
+  .cos_max = 0
+};
+
+struct AMR_CalibParams amr_calib;
+struct AMR_Normalized amr_normalized;
+
+float amr_angle_deg_raw = 0.0f;
+const float amr_angle_deg_offset = 79.6f + 8.1f;
+float amr_angle_deg = 0.0f;
 
 /* USER CODE END PV */
 
@@ -98,7 +129,18 @@ static void MX_TIM17_Init(void);
 
 /*Private Function Prototypes**************************************************/
 void calibrateADCs(void);					// calibrating ADC
-void getDMAValues(void);					// reading ADC values from direct memory access
+struct ADC_Values getDMAValues(const uint16_t *dma_values);	// reading ADC values from direct memory access
+
+void writeRTT(struct ADC_Values adc_result,
+              const struct AMR_MinMax *minmax,
+              float angle_deg_raw,
+              float angle_deg);
+void writeRTTFloat2(float value);
+
+void amr_update_minmax(struct AMR_MinMax *minmax, uint16_t sin_val, uint16_t cos_val);
+struct AMR_CalibParams amr_compute_calibration(const struct AMR_MinMax *minmax);
+struct AMR_Normalized amr_normalize(uint16_t sin_val, uint16_t cos_val, const struct AMR_CalibParams *calib);
+float amr_calculate_angle(float sin_norm, float cos_norm);
 
 /* USER CODE END PFP */
 
@@ -128,17 +170,99 @@ void calibrateADCs(void){
 	}
 }
 
-void getDMAValues(void){
+struct ADC_Values getDMAValues(const uint16_t *dma_values){
 	/*INFOBOX: (CLICK TO OPEN)
 	 * This function reads ADC values directly from DMA (RAM) and stores them into result struct for
 	 * better readability/handling.
 	 */
+	struct ADC_Values result;
 
-	ADCresult.SIN1 = adcVal[I_SIN1];			//fill struct with ADC values from DMA Array
-	ADCresult.COS1 = adcVal[I_COS1];
-	ADCresult.VDIAG1 = adcVal[I_VDIAG1];
+	result.SIN1 = dma_values[I_SIN1];			//fill struct with ADC values from DMA Array
+	result.COS1 = dma_values[I_COS1];
+	result.VDIAG1 = dma_values[I_VDIAG1];
+	return result;
 }
 
+void writeRTT(struct ADC_Values adc_result,
+              const struct AMR_MinMax *minmax,
+              float angle_deg_raw,
+              float angle_deg){
+	SEGGER_RTT_printf(0,
+		"SIN1=%u (min:%u max:%u) COS1=%u (min:%u max:%u) VDIAG1=%u\r\nangle_raw=",
+		adc_result.SIN1,
+		minmax->sin_min,
+		minmax->sin_max,
+		adc_result.COS1,
+		minmax->cos_min,
+		minmax->cos_max,
+		adc_result.VDIAG1);
+	writeRTTFloat2(angle_deg_raw);
+	SEGGER_RTT_WriteString(0, "° angle=");
+	writeRTTFloat2(angle_deg);
+	SEGGER_RTT_WriteString(0, "°\r\n");
+}
+
+void writeRTTFloat2(float value){
+	int32_t centi_degrees = (int32_t)(value * 100.0f + (value >= 0.0f ? 0.5f : -0.5f));
+	const char *sign = "";
+
+	if (centi_degrees < 0) {
+		sign = "-";
+		centi_degrees = -centi_degrees;
+	}
+
+	SEGGER_RTT_printf(0, "%s%ld.%02ld", sign, centi_degrees / 100, centi_degrees % 100);
+}
+
+void amr_update_minmax(struct AMR_MinMax *minmax, uint16_t sin_val, uint16_t cos_val) {
+  if (sin_val < minmax->sin_min) minmax->sin_min = sin_val;
+  if (sin_val > minmax->sin_max) minmax->sin_max = sin_val;
+  if (cos_val < minmax->cos_min) minmax->cos_min = cos_val;
+  if (cos_val > minmax->cos_max) minmax->cos_max = cos_val;
+}
+
+struct AMR_CalibParams amr_compute_calibration(const struct AMR_MinMax *minmax) {
+	struct AMR_CalibParams result;
+
+	/* Amplitude */
+	result.cos_amplitude = (float)(minmax->cos_max - minmax->cos_min) / 2.0f;
+	result.sin_amplitude = (float)(minmax->sin_max - minmax->sin_min) / 2.0f;
+
+	/* Offset */
+	result.cos_offset = (float)(minmax->cos_max + minmax->cos_min) / 2.0f;
+	result.sin_offset = (float)(minmax->sin_max + minmax->sin_min) / 2.0f;
+	return result;
+}
+
+/*
+ * Task 2b: Normalization
+ * Returns: range [-1, 1].
+ */
+struct AMR_Normalized amr_normalize(uint16_t sin_val, uint16_t cos_val, const struct AMR_CalibParams *calib) {
+	struct AMR_Normalized result;
+	result.sin = ((float)sin_val - calib->sin_offset) / calib->sin_amplitude;
+	result.cos = ((float)cos_val - calib->cos_offset) / calib->cos_amplitude;
+	return result;
+}
+
+/*
+ * Task 3: Angle Calculation
+ */
+float amr_calculate_angle(float sin_norm, float cos_norm) {
+	/* atan2: returns [-pi, pi] */
+	float angle_rad = atan2f(sin_norm, cos_norm);
+
+	/* Convert to degrees */
+	float angle_deg = angle_rad * RAD_TO_DEG;
+
+  /* Bring into range [0, 360] */
+	if (angle_deg < 0.0f) {
+		angle_deg += 360.0f;
+	}
+
+	/* A full rotation of the sensor is only 180° mechanically */
+	return angle_deg / 2.0f;
+}
 
 /* USER CODE END 0 */
 
@@ -181,6 +305,9 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
   /* Initialize user-defined Peripherals ***************************************************************/
+  SEGGER_RTT_Init();
+  SEGGER_RTT_WriteString(0, "RTT initialized\r\n");
+
   calibrateADCs();													// calibrate ADCs												// signal, that Sensor Unit is ready to use and check Error-Light
 
   HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t*)adcVal, 3);		// configure ADC mode
@@ -651,7 +778,17 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc){
 
 	HAL_ResumeTick();							// µController wake up
 
-	getDMAValues();								// save raw ADC values from DMA array into struct
+	ADCresult = getDMAValues(adcVal);			// save raw ADC values from DMA array into struct
+
+	amr_update_minmax(&amr_minmax, ADCresult.SIN1, ADCresult.COS1);
+	amr_calib = amr_compute_calibration(&amr_minmax);
+	amr_normalized = amr_normalize(ADCresult.SIN1, ADCresult.COS1, &amr_calib);
+	amr_angle_deg_raw = amr_calculate_angle(amr_normalized.sin, amr_normalized.cos);
+	amr_angle_deg = amr_angle_deg_raw - amr_angle_deg_offset;
+  if (amr_angle_deg < 0.0f) {
+    amr_angle_deg += 180.0f;
+  }
+	writeRTT(ADCresult, &amr_minmax, amr_angle_deg_raw, amr_angle_deg);
 
 	HAL_SuspendTick();
 
