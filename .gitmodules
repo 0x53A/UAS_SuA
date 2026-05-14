@@ -1,3 +1,6 @@
 [submodule "Assignment1_AMR_Sensor/Middlewares/RTT"]
 	path = Assignment1_AMR_Sensor/Middlewares/RTT
 	url = https://github.com/SEGGERMicro/RTT.git
+[submodule "Assignment2_Stepper_Motor/Middlewares/RTT"]
+	path = Assignment2_Stepper_Motor/Middlewares/RTT
+	url = https://github.com/SEGGERMicro/RTT.git
