@@ -4,7 +4,7 @@ mod serial_comm;
 use eframe::egui;
 use egui::{Color32, RichText};
 use egui_plot::{Line, Plot, PlotPoints};
-use serial_comm::{Command, Telemetry};
+use serial_comm::{Command, SharedWriter, Telemetry};
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -51,7 +51,7 @@ struct SuaApp {
     telemetry: Arc<Mutex<Telemetry>>,
     serial_connected: Arc<Mutex<bool>>,
     gamepad_input: Arc<Mutex<gamepad::GamepadInput>>,
-    serial_writer: Option<Box<dyn serialport::SerialPort>>,
+    serial_writer: SharedWriter,
     port_name: String,
 
     history: AngleHistory,
@@ -74,20 +74,20 @@ impl SuaApp {
         let telemetry = Arc::new(Mutex::new(Telemetry::default()));
         let serial_connected = Arc::new(Mutex::new(false));
         let gamepad_input = Arc::new(Mutex::new(gamepad::GamepadInput::default()));
+        let serial_writer: SharedWriter = Arc::new(Mutex::new(None));
 
         {
             let t = telemetry.clone();
             let c = serial_connected.clone();
+            let w = serial_writer.clone();
             let pn = port_name.clone();
-            std::thread::spawn(move || serial_comm::run_reader(&pn, t, c));
+            std::thread::spawn(move || serial_comm::run_reader(&pn, t, c, w));
         }
 
         {
             let gp = gamepad_input.clone();
             std::thread::spawn(move || gamepad::run(gp));
         }
-
-        let serial_writer = serial_comm::open_writer(&port_name);
 
         Self {
             telemetry,
@@ -111,12 +111,12 @@ impl SuaApp {
 
     fn send_command(&mut self, cmd: Command) {
         let wire = cmd.to_wire();
-        if let Some(ref mut port) = self.serial_writer {
-            if port.write_all(wire.as_bytes()).is_err() {
-                self.serial_writer = serial_comm::open_writer(&self.port_name);
+        if let Some(ref mut port) = *self.serial_writer.lock().unwrap() {
+            if let Err(e) = port.write_all(wire.as_bytes()) {
+                eprintln!("Serial write error: {e}");
             }
         } else {
-            self.serial_writer = serial_comm::open_writer(&self.port_name);
+            eprintln!("Serial writer not available");
         }
     }
 

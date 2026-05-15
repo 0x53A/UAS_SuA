@@ -64,7 +64,14 @@ pub fn find_serial_port() -> Option<String> {
     ports.first().map(|p| p.port_name.clone())
 }
 
-pub fn run_reader(port_name: &str, telemetry: Arc<Mutex<Telemetry>>, connected: Arc<Mutex<bool>>) {
+pub type SharedWriter = Arc<Mutex<Option<Box<dyn serialport::SerialPort>>>>;
+
+pub fn run_reader(
+    port_name: &str,
+    telemetry: Arc<Mutex<Telemetry>>,
+    connected: Arc<Mutex<bool>>,
+    writer: SharedWriter,
+) {
     loop {
         let port = serialport::new(port_name, 115200)
             .timeout(Duration::from_millis(100))
@@ -73,6 +80,13 @@ pub fn run_reader(port_name: &str, telemetry: Arc<Mutex<Telemetry>>, connected: 
         let port = match port {
             Ok(p) => {
                 *connected.lock().unwrap() = true;
+                match p.try_clone() {
+                    Ok(mut w) => {
+                        let _ = w.set_timeout(Duration::from_secs(1));
+                        *writer.lock().unwrap() = Some(w);
+                    }
+                    Err(e) => eprintln!("Serial clone failed: {e}"),
+                }
                 eprintln!("Serial connected: {port_name}");
                 p
             }
@@ -101,15 +115,9 @@ pub fn run_reader(port_name: &str, telemetry: Arc<Mutex<Telemetry>>, connected: 
             }
         }
 
+        *writer.lock().unwrap() = None;
         *connected.lock().unwrap() = false;
         eprintln!("Serial disconnected, reconnecting...");
         std::thread::sleep(Duration::from_secs(1));
     }
-}
-
-pub fn open_writer(port_name: &str) -> Option<Box<dyn serialport::SerialPort>> {
-    serialport::new(port_name, 115200)
-        .timeout(Duration::from_millis(100))
-        .open()
-        .ok()
 }

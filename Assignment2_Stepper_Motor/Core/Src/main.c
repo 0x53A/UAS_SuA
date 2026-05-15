@@ -100,8 +100,10 @@ struct UartRxBuf {
 #define RAMP_ACCEL_STEPS     200        // steps over which to accelerate
 
 /* Valid angle range */
-#define ANGLE_MIN_DEG        0.0f
-#define ANGLE_MAX_DEG        180.0f
+#define ANGLE_MIN_DEG        2.0f
+#define ANGLE_MAX_DEG        178.0f
+#define POSITION_MIN_STEPS   ((int32_t)(ANGLE_MIN_DEG / DEG_PER_MICROSTEP))
+#define POSITION_MAX_STEPS   ((int32_t)(ANGLE_MAX_DEG / DEG_PER_MICROSTEP))
 
 /* UART protocol */
 #define CMD_HEADER           "|SuA|"
@@ -166,18 +168,26 @@ uint16_t adcVal[8];
 struct ADC_Values ADCresult;
 struct XY_Values XYresult;
 
+// struct AMR_MinMax amr_minmax = {
+//   .sin_min = UINT16_MAX,
+//   .sin_max = 0,
+//   .cos_min = UINT16_MAX,
+//   .cos_max = 0
+// };
+
+// L1.3
 struct AMR_MinMax amr_minmax = {
-  .sin_min = UINT16_MAX,
-  .sin_max = 0,
-  .cos_min = UINT16_MAX,
-  .cos_max = 0
+  .sin_min = 634,
+  .sin_max = 3493,
+  .cos_min = 706,
+  .cos_max = 3494
 };
 
 struct AMR_CalibParams amr_calib;
 struct AMR_Normalized amr_normalized;
 
 float amr_angle_deg_raw = 0.0f;
-const float amr_angle_deg_offset = 79.6f + 8.1f;
+const float amr_angle_deg_offset = 79.6f + 8.1f + 20.0f;
 float amr_angle_deg = 0.0f;
 
 /* Stepper state — visible in debugger */
@@ -254,6 +264,7 @@ void stepper_start_position(float target_deg, uint16_t max_speed_pct);
 void stepper_start_calibration(float cal_angle_deg);
 void stepper_stop(void);
 void stepper_update_motor_angle(void);
+bool stepper_can_step(int8_t dir);
 uint16_t speed_pct_to_arr(uint16_t pct);
 
 /* Telemetry */
@@ -486,8 +497,12 @@ void parse_command(const char *cmd, uint8_t len) {
 			log_command_result(cmd, "ERROR", "invalid velocity format");
 		} else if (vel < -10000 || vel > 10000) {
 			log_command_result(cmd, "ERROR", "velocity out of range");
+		} else if (vel != 0 && !stepper.calibrated) {
+			log_command_result(cmd, "ERROR", "not calibrated");
 		} else if (vel != 0 && !stepper.enabled) {
 			log_command_result(cmd, "ERROR", "motor disabled");
+		} else if (vel != 0 && !stepper_can_step(vel > 0 ? 1 : -1)) {
+			log_command_result(cmd, "ERROR", "software end stop");
 		} else {
 			stepper_start_velocity((int16_t)vel);
 			log_command_result(cmd, "OK", "");
@@ -573,6 +588,13 @@ void stepper_update_motor_angle(void) {
 	stepper.motor_angle_deg = (float)stepper.current_pos * DEG_PER_MICROSTEP;
 }
 
+bool stepper_can_step(int8_t dir) {
+	if (!stepper.calibrated) return false;
+	if (dir > 0 && stepper.current_pos >= POSITION_MAX_STEPS) return false;
+	if (dir < 0 && stepper.current_pos <= POSITION_MIN_STEPS) return false;
+	return true;
+}
+
 void stepper_set_enabled(bool en) {
 	stepper.enabled = en;
 	HAL_GPIO_WritePin(Enable_GPIO_Port, Enable_Pin, en ? GPIO_PIN_RESET : GPIO_PIN_SET);
@@ -595,17 +617,22 @@ void stepper_stop(void) {
 }
 
 void stepper_start_velocity(int16_t pct) {
-	if (!stepper.enabled) return;
-
 	if (pct == 0) {
 		stepper_stop();
 		return;
 	}
 
+	if (!stepper.enabled || !stepper.calibrated) return;
+
 	stepper.mode = MODE_VELOCITY;
 	stepper.velocity_pct = pct;
 
 	int8_t dir = (pct > 0) ? 1 : -1;
+	if (!stepper_can_step(dir)) {
+		stepper_stop();
+		return;
+	}
+
 	stepper_set_direction(dir);
 
 	uint16_t abs_pct = (uint16_t)(pct > 0 ? pct : -pct);
@@ -1293,6 +1320,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
 		if (!stepper.enabled) return;
 
 		if (stepper.mode == MODE_VELOCITY) {
+			if (!stepper_can_step(stepper.direction)) {
+				stepper_stop();
+				return;
+			}
+
 			/* Continuous stepping — toggle the STEP pin */
 			HAL_GPIO_TogglePin(Step_GPIO_Port, Step_Pin);
 
@@ -1300,16 +1332,29 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
 			static bool step_high = false;
 			step_high = !step_high;
 			if (step_high) {
+				if (!stepper_can_step(stepper.direction)) {
+					stepper_stop();
+					return;
+				}
 				stepper.current_pos += stepper.direction;
 				stepper_update_motor_angle();
 			}
 		}
 		else if (stepper.mode == MODE_POSITION && stepper.steps_remaining > 0) {
+			if (!stepper_can_step(stepper.direction)) {
+				stepper_stop();
+				return;
+			}
+
 			HAL_GPIO_TogglePin(Step_GPIO_Port, Step_Pin);
 
 			static bool pos_step_high = false;
 			pos_step_high = !pos_step_high;
 			if (pos_step_high) {
+				if (!stepper_can_step(stepper.direction)) {
+					stepper_stop();
+					return;
+				}
 				stepper.current_pos += stepper.direction;
 				stepper.steps_remaining--;
 				stepper_update_motor_angle();
