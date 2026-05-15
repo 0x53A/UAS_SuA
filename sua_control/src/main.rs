@@ -4,7 +4,7 @@ mod serial_comm;
 use eframe::egui;
 use egui::{Color32, RichText};
 use egui_plot::{Line, Plot, PlotPoints};
-use serial_comm::{Command, SharedWriter, Telemetry};
+use serial_comm::{Command, SharedEvent, SharedWriter, Telemetry};
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -12,6 +12,8 @@ use std::time::Instant;
 
 const HISTORY_SECONDS: f64 = 60.0;
 const HISTORY_CAPACITY: usize = 60 * 50;
+const ANGLE_MIN_DEG: f64 = 2.0;
+const ANGLE_MAX_DEG: f64 = 178.0;
 
 struct AngleHistory {
     motor: VecDeque<(f64, f64)>,
@@ -52,7 +54,7 @@ struct SuaApp {
     serial_connected: Arc<Mutex<bool>>,
     gamepad_input: Arc<Mutex<gamepad::GamepadInput>>,
     serial_writer: SharedWriter,
-    port_name: String,
+    serial_event: SharedEvent,
 
     history: AngleHistory,
     start_time: Instant,
@@ -75,13 +77,15 @@ impl SuaApp {
         let serial_connected = Arc::new(Mutex::new(false));
         let gamepad_input = Arc::new(Mutex::new(gamepad::GamepadInput::default()));
         let serial_writer: SharedWriter = Arc::new(Mutex::new(None));
+        let serial_event: SharedEvent = Arc::new(Mutex::new(String::new()));
 
         {
             let t = telemetry.clone();
             let c = serial_connected.clone();
             let w = serial_writer.clone();
+            let e = serial_event.clone();
             let pn = port_name.clone();
-            std::thread::spawn(move || serial_comm::run_reader(&pn, t, c, w));
+            std::thread::spawn(move || serial_comm::run_reader(&pn, t, c, w, e));
         }
 
         {
@@ -94,7 +98,7 @@ impl SuaApp {
             serial_connected,
             gamepad_input,
             serial_writer,
-            port_name,
+            serial_event,
             history: AngleHistory::new(),
             start_time: Instant::now(),
             control_mode: ControlMode::Velocity,
@@ -163,12 +167,12 @@ impl SuaApp {
             ControlMode::Position => {
                 let raw = gp.right_x;
                 if raw.abs() > DEADZONE {
-                    self.target_angle = (self.target_angle + raw as f64 * 0.5).clamp(0.0, 180.0);
+                    self.target_angle = (self.target_angle + raw as f64 * 0.5).clamp(ANGLE_MIN_DEG, ANGLE_MAX_DEG);
                 }
-                if gp.dpad_right { self.target_angle = (self.target_angle + 1.0).min(180.0); }
-                if gp.dpad_left { self.target_angle = (self.target_angle - 1.0).max(0.0); }
-                if gp.dpad_up { self.target_angle = (self.target_angle + 0.1).min(180.0); }
-                if gp.dpad_down { self.target_angle = (self.target_angle - 0.1).max(0.0); }
+                if gp.dpad_right { self.target_angle = (self.target_angle + 1.0).min(ANGLE_MAX_DEG); }
+                if gp.dpad_left { self.target_angle = (self.target_angle - 1.0).max(ANGLE_MIN_DEG); }
+                if gp.dpad_up { self.target_angle = (self.target_angle + 0.1).min(ANGLE_MAX_DEG); }
+                if gp.dpad_down { self.target_angle = (self.target_angle - 0.1).max(ANGLE_MIN_DEG); }
 
                 let trigger_speed = 10.0 + gp.right_trigger as f64 * 90.0;
                 self.max_speed_pct = trigger_speed;
@@ -191,6 +195,7 @@ impl eframe::App for SuaApp {
 
         let telem = self.telemetry.lock().unwrap().clone();
         let serial_ok = *self.serial_connected.lock().unwrap();
+        let serial_event = self.serial_event.lock().unwrap().clone();
         let gp = self.gamepad_input.lock().unwrap().clone();
 
         let now = self.start_time.elapsed().as_secs_f64();
@@ -218,6 +223,10 @@ impl eframe::App for SuaApp {
                     ui.colored_label(Color32::from_rgb(0, 200, 0), "CAL OK");
                 } else {
                     ui.colored_label(Color32::from_rgb(200, 160, 0), "NOT CAL");
+                }
+                if !serial_event.is_empty() {
+                    ui.separator();
+                    ui.label(format!("Last command: {serial_event}"));
                 }
             });
         });
@@ -260,7 +269,7 @@ impl eframe::App for SuaApp {
                 ControlMode::Position => {
                     ui.heading("Position");
                     ui.add_space(4.0);
-                    ui.add(egui::Slider::new(&mut self.target_angle, 0.0..=180.0).suffix("°").text("Target"));
+                    ui.add(egui::Slider::new(&mut self.target_angle, ANGLE_MIN_DEG..=ANGLE_MAX_DEG).suffix("°").text("Target"));
                     ui.add(egui::Slider::new(&mut self.max_speed_pct, 1.0..=100.0).suffix("%").text("Max Spd"));
                     if ui.button("Go [B]").clicked() {
                         let pos = (self.target_angle * 100.0) as i32;
@@ -273,7 +282,7 @@ impl eframe::App for SuaApp {
             ui.add_space(16.0);
             ui.separator();
             ui.heading("Calibration");
-            ui.add(egui::Slider::new(&mut self.calibration_angle, 0.5..=179.5).suffix("°").text("Zero Pt"));
+            ui.add(egui::Slider::new(&mut self.calibration_angle, ANGLE_MIN_DEG..=ANGLE_MAX_DEG).suffix("°").text("Zero Pt"));
             if ui.button("Calibrate [A]").clicked() {
                 let angle_cdeg = (self.calibration_angle * 100.0) as i32;
                 self.send_command(Command::Calibrate(angle_cdeg));

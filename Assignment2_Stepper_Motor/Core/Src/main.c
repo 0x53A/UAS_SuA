@@ -68,7 +68,9 @@ struct StepperState {
 struct UartRxBuf {
 	uint8_t data[UART_RX_BUF_SIZE];
 	volatile uint16_t head;
-	uint16_t tail;
+	volatile uint16_t tail;
+	volatile bool ring_overflow;
+	volatile uint32_t error_code;
 };
 
 /* UART TX buffer */
@@ -207,8 +209,7 @@ volatile struct StepperState stepper = {
 };
 
 /* UART */
-struct UartRxBuf uart_rx = { .head = 0, .tail = 0 };
-uint8_t uart_rx_byte;
+struct UartRxBuf uart_rx = { .head = 0, .tail = 0, .ring_overflow = false, .error_code = 0 };
 char uart_tx_buf[UART_TX_BUF_SIZE];
 
 /* Command parse buffer */
@@ -218,6 +219,7 @@ uint8_t cmd_buf_pos = 0;
 
 /* Telemetry counter */
 uint32_t telemetry_counter = 0;
+volatile bool telemetry_due = false;
 
 /* USER CODE END PV */
 
@@ -238,12 +240,6 @@ static void MX_USART2_UART_Init(void);
 void calibrateADCs(void);					// calibrating ADC
 struct ADC_Values getDMAValues(const uint16_t *dma_values);	// reading ADC values from direct memory access
 
-void writeRTT(struct ADC_Values adc_result,
-              const struct AMR_MinMax *minmax,
-              float angle_deg_raw,
-              float angle_deg);
-void writeRTTFloat2(float value);
-
 void amr_update_minmax(struct AMR_MinMax *minmax, uint16_t sin_val, uint16_t cos_val);
 struct AMR_CalibParams amr_compute_calibration(const struct AMR_MinMax *minmax);
 struct AMR_Normalized amr_normalize(uint16_t sin_val, uint16_t cos_val, const struct AMR_CalibParams *calib);
@@ -251,8 +247,10 @@ float amr_calculate_angle(float sin_norm, float cos_norm);
 
 /* UART */
 void uart_send(const char *str);
+void uart_handle_irq(void);
 void uart_process_rx(void);
 void parse_command(const char *cmd, uint8_t len);
+bool command_frame_complete(const char *cmd, uint8_t len);
 bool parse_i32_field(const char *cmd, uint8_t len, uint8_t *index, int32_t *value);
 void log_command_result(const char *cmd, const char *status, const char *reason);
 
@@ -312,37 +310,6 @@ struct ADC_Values getDMAValues(const uint16_t *dma_values){
 	return result;
 }
 
-void writeRTT(struct ADC_Values adc_result,
-              const struct AMR_MinMax *minmax,
-              float angle_deg_raw,
-              float angle_deg){
-	SEGGER_RTT_printf(0,
-		"SIN1=%u (min:%u max:%u) COS1=%u (min:%u max:%u) VDIAG1=%u\r\nangle_raw=",
-		adc_result.SIN1,
-		minmax->sin_min,
-		minmax->sin_max,
-		adc_result.COS1,
-		minmax->cos_min,
-		minmax->cos_max,
-		adc_result.VDIAG1);
-	writeRTTFloat2(angle_deg_raw);
-	SEGGER_RTT_WriteString(0, "° angle=");
-	writeRTTFloat2(angle_deg);
-	SEGGER_RTT_WriteString(0, "°\r\n");
-}
-
-void writeRTTFloat2(float value){
-	int32_t centi_degrees = (int32_t)(value * 100.0f + (value >= 0.0f ? 0.5f : -0.5f));
-	const char *sign = "";
-
-	if (centi_degrees < 0) {
-		sign = "-";
-		centi_degrees = -centi_degrees;
-	}
-
-	SEGGER_RTT_printf(0, "%s%ld.%02ld", sign, centi_degrees / 100, centi_degrees % 100);
-}
-
 void amr_update_minmax(struct AMR_MinMax *minmax, uint16_t sin_val, uint16_t cos_val) {
   if (sin_val < minmax->sin_min) minmax->sin_min = sin_val;
   if (sin_val > minmax->sin_max) minmax->sin_max = sin_val;
@@ -397,6 +364,32 @@ void uart_send(const char *str) {
 	HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 50);
 }
 
+void uart_handle_irq(void) {
+	uint32_t isr = USART2->ISR;
+
+	if (isr & USART_ISR_ORE) {
+		USART2->ICR = USART_ICR_ORECF;
+		uart_rx.error_code |= HAL_UART_ERROR_ORE;
+	}
+	if (isr & USART_ISR_FE) {
+		USART2->ICR = USART_ICR_FECF;
+	}
+	if (isr & USART_ISR_NE) {
+		USART2->ICR = USART_ICR_NECF;
+	}
+
+	while (USART2->ISR & USART_ISR_RXNE_RXFNE) {
+		uint8_t byte = (uint8_t)(USART2->RDR & 0xFF);
+		uint16_t next_head = (uart_rx.head + 1) % UART_RX_BUF_SIZE;
+		if (next_head != uart_rx.tail) {
+			uart_rx.data[uart_rx.head] = byte;
+			uart_rx.head = next_head;
+		} else {
+			uart_rx.ring_overflow = true;
+		}
+	}
+}
+
 /*==========================================================================
  * UART command parser
  *
@@ -408,6 +401,22 @@ void uart_send(const char *str) {
  *==========================================================================*/
 
 void uart_process_rx(void) {
+	if (uart_rx.ring_overflow) {
+		uart_rx.ring_overflow = false;
+		uart_rx.tail = uart_rx.head;
+		cmd_buf_pos = 0;
+		log_command_result("", "ERROR", "rx ring overflow");
+	}
+
+	if (uart_rx.error_code != 0) {
+		uint32_t error_code = uart_rx.error_code;
+		uart_rx.error_code = 0;
+		cmd_buf_pos = 0;
+		char reason[32];
+		snprintf(reason, sizeof(reason), "uart error 0x%08lX", error_code);
+		log_command_result("", "ERROR", reason);
+	}
+
 	while (uart_rx.tail != uart_rx.head) {
 		char c = uart_rx.data[uart_rx.tail];
 		uart_rx.tail = (uart_rx.tail + 1) % UART_RX_BUF_SIZE;
@@ -423,6 +432,11 @@ void uart_process_rx(void) {
 
 		if (cmd_buf_pos < CMD_BUF_SIZE - 1) {
 			cmd_buf[cmd_buf_pos++] = c;
+			if (command_frame_complete(cmd_buf, cmd_buf_pos)) {
+				cmd_buf[cmd_buf_pos] = '\0';
+				parse_command(cmd_buf, cmd_buf_pos);
+				cmd_buf_pos = 0;
+			}
 		} else {
 			cmd_buf[cmd_buf_pos] = '\0';
 			log_command_result(cmd_buf, "ERROR", "command too long");
@@ -431,12 +445,57 @@ void uart_process_rx(void) {
 	}
 }
 
+bool command_frame_complete(const char *cmd, uint8_t len) {
+	if (len < CMD_ARG_START_INDEX + 2) {
+		return false;
+	}
+	if (memcmp(cmd, CMD_HEADER, CMD_HEADER_LEN) != 0) {
+		return false;
+	}
+	if (cmd[CMD_MODE_INDEX + 1] != '|') {
+		return false;
+	}
+	if (cmd[len - 1] != '|') {
+		return false;
+	}
+
+	uint8_t expected_pipes;
+	switch (cmd[CMD_MODE_INDEX]) {
+	case 'P':
+		expected_pipes = 5;
+		break;
+	case 'V':
+	case 'C':
+	case 'E':
+		expected_pipes = 4;
+		break;
+	default:
+		return false;
+	}
+
+	uint8_t pipes = 0;
+	for (uint8_t i = 0; i < len; i++) {
+		if (cmd[i] == '|') {
+			pipes++;
+		}
+	}
+	return pipes >= expected_pipes;
+}
+
 void log_command_result(const char *cmd, const char *status, const char *reason) {
 	SEGGER_RTT_printf(0, "CMD %s -> %s", cmd, status);
 	if (reason != NULL && reason[0] != '\0') {
 		SEGGER_RTT_printf(0, " (%s)", reason);
 	}
 	SEGGER_RTT_WriteString(0, "\r\n");
+
+	int len = snprintf(uart_tx_buf, UART_TX_BUF_SIZE,
+		"{\"event\":\"cmd\",\"status\":\"%s\",\"reason\":\"%s\"}\n",
+		status,
+		(reason != NULL) ? reason : "");
+	if (len > 0 && len < UART_TX_BUF_SIZE) {
+		uart_send(uart_tx_buf);
+	}
 }
 
 bool parse_i32_field(const char *cmd, uint8_t len, uint8_t *index, int32_t *value) {
@@ -772,6 +831,15 @@ int main(void)
   /* Motor disabled at startup */
   stepper_set_enabled(false);
 
+  // stepper_set_enabled(true);
+  // stepper_set_direction(1);
+
+  // while(1) {
+   
+	// 		HAL_GPIO_TogglePin(Step_GPIO_Port, Step_Pin);
+  //     HAL_Delay(10);
+  // }
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -782,6 +850,10 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     uart_process_rx();
+    if (telemetry_due) {
+      telemetry_due = false;
+      send_telemetry();
+    }
   }
   /* USER CODE END 3 */
 }
@@ -1196,14 +1268,12 @@ static void MX_USART2_UART_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  if (HAL_UARTEx_EnableFifoMode(&huart2) != HAL_OK)
   {
     Error_Handler();
   }
   /* USER CODE BEGIN USART2_Init 2 */
-  HAL_NVIC_SetPriority(USART2_IRQn, 1, 0);
-  HAL_NVIC_EnableIRQ(USART2_IRQn);
-  HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+	  __HAL_UART_ENABLE_IT(&huart2, UART_IT_RXNE);
   /* USER CODE END USART2_Init 2 */
 
 }
@@ -1220,10 +1290,10 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA1_Channel1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 2, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
   /* DMA1_Channel2_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 2, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
 
 }
@@ -1269,14 +1339,6 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-	if (huart == &huart2) {
-		uart_rx.data[uart_rx.head] = uart_rx_byte;
-		uart_rx.head = (uart_rx.head + 1) % UART_RX_BUF_SIZE;
-		HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
-	}
-}
-
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc){
 
 	/*INFOBOX: (CLICK TO OPEN)
@@ -1299,13 +1361,12 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc){
   }
 
 	stepper.amr_angle_deg = amr_angle_deg;
-	writeRTT(ADCresult, &amr_minmax, amr_angle_deg_raw, amr_angle_deg);
 
 	/* Send telemetry at reduced rate */
 	telemetry_counter++;
 	if (telemetry_counter >= TELEMETRY_DIVISOR) {
 		telemetry_counter = 0;
-		send_telemetry();
+		telemetry_due = true;
 	}
 }
 
@@ -1399,6 +1460,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
   */
 void Error_Handler(void)
 {
+  SEGGER_RTT_printf(0, "Error_Handler called\r\n");
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();

@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -65,12 +66,14 @@ pub fn find_serial_port() -> Option<String> {
 }
 
 pub type SharedWriter = Arc<Mutex<Option<Box<dyn serialport::SerialPort>>>>;
+pub type SharedEvent = Arc<Mutex<String>>;
 
 pub fn run_reader(
     port_name: &str,
     telemetry: Arc<Mutex<Telemetry>>,
     connected: Arc<Mutex<bool>>,
     writer: SharedWriter,
+    last_event: SharedEvent,
 ) {
     loop {
         let port = serialport::new(port_name, 115200)
@@ -102,8 +105,29 @@ pub fn run_reader(
         for line in reader.lines() {
             match line {
                 Ok(line) => {
-                    if let Ok(t) = serde_json::from_str::<Telemetry>(&line) {
-                        *telemetry.lock().unwrap() = t;
+                    if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                        if let Some(event) = value.get("event").and_then(Value::as_str) {
+                            let status = value.get("status").and_then(Value::as_str).unwrap_or("");
+                            let reason = value.get("reason").and_then(Value::as_str).unwrap_or("");
+                            if reason.is_empty() {
+                                let message = format!("{event} {status}");
+                                *last_event.lock().unwrap() = message.clone();
+                                eprintln!("Serial event: {message}");
+                            } else {
+                                let message = format!("{event} {status} ({reason})");
+                                *last_event.lock().unwrap() = message.clone();
+                                eprintln!("Serial event: {message}");
+                            }
+                        }
+
+                        let is_telemetry = ["mode", "motor", "amr", "target", "vel", "sps", "en", "cal", "rem"]
+                            .iter()
+                            .any(|field| value.get(*field).is_some());
+                        if is_telemetry {
+                            if let Ok(t) = serde_json::from_value::<Telemetry>(value) {
+                                *telemetry.lock().unwrap() = t;
+                            }
+                        }
                     }
                 }
                 Err(e) => {
