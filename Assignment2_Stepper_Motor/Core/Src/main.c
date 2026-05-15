@@ -34,11 +34,45 @@
 #include "math.h"		// for use of standard math functions
 #include "stdlib.h"		// for use of abs() function
 #include "stdbool.h"	// for use of true/false states
+#include "string.h"
+#include "stdio.h"
 #include "SEGGER_RTT.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+enum StepperMode {
+	MODE_IDLE = 0,
+	MODE_VELOCITY,
+	MODE_POSITION
+};
+
+struct StepperState {
+	enum StepperMode mode;
+	int32_t current_pos;        // microsteps from calibrated zero
+	float motor_angle_deg;      // derived from current_pos
+	float amr_angle_deg;        // from AMR sensor
+	float target_angle_deg;     // position mode target
+	int32_t steps_remaining;    // position mode: steps left to go
+	int32_t steps_total;        // position mode: total steps for this move (for ramp calc)
+	int16_t velocity_pct;       // velocity %*100, range +-10000
+	uint16_t current_arr;       // current timer ARR value
+	bool enabled;               // motor driver enabled
+	bool calibrated;            // zero calibration done
+	int8_t direction;           // +1 or -1
+};
+
+/* UART RX ring buffer */
+#define UART_RX_BUF_SIZE 128
+struct UartRxBuf {
+	uint8_t data[UART_RX_BUF_SIZE];
+	volatile uint16_t head;
+	uint16_t tail;
+};
+
+/* UART TX buffer */
+#define UART_TX_BUF_SIZE 256
 
 /* USER CODE END PTD */
 
@@ -46,6 +80,37 @@
 /* USER CODE BEGIN PD */
 
 #define RAD_TO_DEG (180.0f / M_PI)
+
+/* Stepper motor constants */
+#define STEP_ANGLE_DEG       1.8f
+#define MICROSTEP_FACTOR     64
+#define STEPS_PER_REV        (uint32_t)((360.0f / STEP_ANGLE_DEG) * MICROSTEP_FACTOR)  // 12800
+#define DEG_PER_MICROSTEP    (360.0f / STEPS_PER_REV)
+
+#define F_TIMER              650000UL   // Timer 17 counter frequency after prescaler
+#define ARR_DEFAULT          299
+#define ARR_MIN              10         // max speed clamp
+#define ARR_MAX              65535      // min speed (16-bit limit)
+#define MAX_SPEED_RPS        1.5f       // motor spec limit
+
+/* Position mode ramp */
+#define RAMP_MIN_STEPS       100        // minimum steps before starting decel
+#define RAMP_START_ARR       3000       // slow start ARR
+#define RAMP_CRUISE_ARR      299        // full speed ARR
+#define RAMP_ACCEL_STEPS     200        // steps over which to accelerate
+
+/* Valid angle range */
+#define ANGLE_MIN_DEG        0.0f
+#define ANGLE_MAX_DEG        180.0f
+
+/* UART protocol */
+#define CMD_HEADER           "|SuA|"
+#define CMD_HEADER_LEN       5
+#define CMD_MODE_INDEX       CMD_HEADER_LEN
+#define CMD_ARG_START_INDEX  (CMD_HEADER_LEN + 2)
+
+/* Telemetry rate: send every N ADC callbacks (~500 Hz ADC → 25 Hz telemetry at divisor 20) */
+#define TELEMETRY_DIVISOR    20
 
 /* USER CODE END PD */
 
@@ -64,6 +129,8 @@ TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim6;
 TIM_HandleTypeDef htim7;
 TIM_HandleTypeDef htim17;
+
+UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 /*VARIABLES******************************************************************/
@@ -113,6 +180,35 @@ float amr_angle_deg_raw = 0.0f;
 const float amr_angle_deg_offset = 79.6f + 8.1f;
 float amr_angle_deg = 0.0f;
 
+/* Stepper state — visible in debugger */
+volatile struct StepperState stepper = {
+	.mode = MODE_IDLE,
+	.current_pos = 0,
+	.motor_angle_deg = 0.0f,
+	.amr_angle_deg = 0.0f,
+	.target_angle_deg = 0.0f,
+	.steps_remaining = 0,
+	.steps_total = 0,
+	.velocity_pct = 0,
+	.current_arr = ARR_DEFAULT,
+	.enabled = false,
+	.calibrated = false,
+	.direction = 1
+};
+
+/* UART */
+struct UartRxBuf uart_rx = { .head = 0, .tail = 0 };
+uint8_t uart_rx_byte;
+char uart_tx_buf[UART_TX_BUF_SIZE];
+
+/* Command parse buffer */
+#define CMD_BUF_SIZE 64
+char cmd_buf[CMD_BUF_SIZE];
+uint8_t cmd_buf_pos = 0;
+
+/* Telemetry counter */
+uint32_t telemetry_counter = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -125,6 +221,7 @@ static void MX_TIM7_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_TIM6_Init(void);
 static void MX_TIM17_Init(void);
+static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 /*Private Function Prototypes**************************************************/
@@ -142,10 +239,31 @@ struct AMR_CalibParams amr_compute_calibration(const struct AMR_MinMax *minmax);
 struct AMR_Normalized amr_normalize(uint16_t sin_val, uint16_t cos_val, const struct AMR_CalibParams *calib);
 float amr_calculate_angle(float sin_norm, float cos_norm);
 
+/* UART */
+void uart_send(const char *str);
+void uart_process_rx(void);
+void parse_command(const char *cmd, uint8_t len);
+bool parse_i32_field(const char *cmd, uint8_t len, uint8_t *index, int32_t *value);
+void log_command_result(const char *cmd, const char *status, const char *reason);
+
+/* Stepper control */
+void stepper_set_enabled(bool en);
+void stepper_set_direction(int8_t dir);
+void stepper_start_velocity(int16_t pct);
+void stepper_start_position(float target_deg, uint16_t max_speed_pct);
+void stepper_start_calibration(float cal_angle_deg);
+void stepper_stop(void);
+void stepper_update_motor_angle(void);
+uint16_t speed_pct_to_arr(uint16_t pct);
+
+/* Telemetry */
+void send_telemetry(void);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
 void calibrateADCs(void){
 	/*INFOBOX: (CLICK TO OPEN)
 	 * This function calibrates the ADC module. Calibration must not be executed while ADC is active.
@@ -264,6 +382,312 @@ float amr_calculate_angle(float sin_norm, float cos_norm) {
 	return angle_deg / 2.0f;
 }
 
+void uart_send(const char *str) {
+	HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 50);
+}
+
+/*==========================================================================
+ * UART command parser
+ *
+ * Protocol: |SuA|<cmd>|<args...>| followed by LF or CRLF
+ * V: |SuA|V|±NNNNN|           velocity %*100
+ * P: |SuA|P|±NNNNN|NNNNN|     position 0.01deg, max speed %*100
+ * C: |SuA|C|NNNNN|            set current position reference to angle 0.01deg
+ * E: |SuA|E|0| or |SuA|E|1|  enable/disable
+ *==========================================================================*/
+
+void uart_process_rx(void) {
+	while (uart_rx.tail != uart_rx.head) {
+		char c = uart_rx.data[uart_rx.tail];
+		uart_rx.tail = (uart_rx.tail + 1) % UART_RX_BUF_SIZE;
+
+		if (c == '\r' || c == '\n') {
+			if (cmd_buf_pos > 0) {
+				cmd_buf[cmd_buf_pos] = '\0';
+				parse_command(cmd_buf, cmd_buf_pos);
+				cmd_buf_pos = 0;
+			}
+			continue;
+		}
+
+		if (cmd_buf_pos < CMD_BUF_SIZE - 1) {
+			cmd_buf[cmd_buf_pos++] = c;
+		} else {
+			cmd_buf[cmd_buf_pos] = '\0';
+			log_command_result(cmd_buf, "ERROR", "command too long");
+			cmd_buf_pos = 0;
+		}
+	}
+}
+
+void log_command_result(const char *cmd, const char *status, const char *reason) {
+	SEGGER_RTT_printf(0, "CMD %s -> %s", cmd, status);
+	if (reason != NULL && reason[0] != '\0') {
+		SEGGER_RTT_printf(0, " (%s)", reason);
+	}
+	SEGGER_RTT_WriteString(0, "\r\n");
+}
+
+bool parse_i32_field(const char *cmd, uint8_t len, uint8_t *index, int32_t *value) {
+	if (*index >= len) {
+		return false;
+	}
+
+	int32_t sign = 1;
+	if (cmd[*index] == '-') {
+		sign = -1;
+		(*index)++;
+	} else if (cmd[*index] == '+') {
+		(*index)++;
+	}
+
+	if (*index >= len || cmd[*index] < '0' || cmd[*index] > '9') {
+		return false;
+	}
+
+	int32_t parsed = 0;
+	while (*index < len && cmd[*index] >= '0' && cmd[*index] <= '9') {
+		parsed = parsed * 10 + (cmd[*index] - '0');
+		(*index)++;
+	}
+
+	if (*index >= len || cmd[*index] != '|') {
+		return false;
+	}
+	(*index)++;
+
+	*value = sign * parsed;
+	return true;
+}
+
+void parse_command(const char *cmd, uint8_t len) {
+	if (len < CMD_ARG_START_INDEX + 2) {
+		log_command_result(cmd, "ERROR", "command too short");
+		return;
+	}
+
+	if (memcmp(cmd, CMD_HEADER, CMD_HEADER_LEN) != 0) {
+		log_command_result(cmd, "ERROR", "invalid header");
+		return;
+	}
+
+	char mode = cmd[CMD_MODE_INDEX];
+	if (cmd[CMD_MODE_INDEX + 1] != '|') {
+		log_command_result(cmd, "ERROR", "missing command separator");
+		return;
+	}
+
+	switch (mode) {
+	case 'V': {
+		/* |SuA|V|±NNNNN| */
+		int32_t vel = 0;
+		uint8_t index = CMD_ARG_START_INDEX;
+		if (!parse_i32_field(cmd, len, &index, &vel) || index != len) {
+			log_command_result(cmd, "ERROR", "invalid velocity format");
+		} else if (vel < -10000 || vel > 10000) {
+			log_command_result(cmd, "ERROR", "velocity out of range");
+		} else if (vel != 0 && !stepper.enabled) {
+			log_command_result(cmd, "ERROR", "motor disabled");
+		} else {
+			stepper_start_velocity((int16_t)vel);
+			log_command_result(cmd, "OK", "");
+		}
+		break;
+	}
+	case 'P': {
+		/* |SuA|P|±NNNNN|NNNNN| */
+		int32_t pos = 0;
+		int32_t spd = 0;
+		uint8_t index = CMD_ARG_START_INDEX;
+		if (!parse_i32_field(cmd, len, &index, &pos) ||
+		    !parse_i32_field(cmd, len, &index, &spd) ||
+		    index != len) {
+			log_command_result(cmd, "ERROR", "invalid position format");
+		} else if (!stepper.enabled) {
+			log_command_result(cmd, "ERROR", "motor disabled");
+		} else if (!stepper.calibrated) {
+			log_command_result(cmd, "ERROR", "not calibrated");
+		} else if (pos < (int32_t)(ANGLE_MIN_DEG * 100.0f) || pos > (int32_t)(ANGLE_MAX_DEG * 100.0f)) {
+			log_command_result(cmd, "ERROR", "position out of range");
+		} else if (spd < 0 || spd > 10000) {
+			log_command_result(cmd, "ERROR", "speed out of range");
+		} else {
+			float target = (float)pos / 100.0f;
+			uint16_t max_spd = (spd > 10000) ? 10000 : (spd < 100 ? 100 : (uint16_t)spd);
+			stepper_start_position(target, max_spd);
+			log_command_result(cmd, "OK", "");
+		}
+		break;
+	}
+	case 'C': {
+		/* |SuA|C|NNNNN| */
+		int32_t cal = 0;
+		uint8_t index = CMD_ARG_START_INDEX;
+		if (!parse_i32_field(cmd, len, &index, &cal) || index != len) {
+			log_command_result(cmd, "ERROR", "invalid calibration format");
+		} else if (cal < (int32_t)(ANGLE_MIN_DEG * 100.0f) || cal > (int32_t)(ANGLE_MAX_DEG * 100.0f)) {
+			log_command_result(cmd, "ERROR", "calibration angle out of range");
+		} else {
+			float cal_deg = (float)cal / 100.0f;
+			stepper_start_calibration(cal_deg);
+			log_command_result(cmd, "OK", "");
+		}
+		break;
+	}
+	case 'E': {
+		/* |SuA|E|0| or |SuA|E|1| */
+		int32_t en = 0;
+		uint8_t index = CMD_ARG_START_INDEX;
+		if (!parse_i32_field(cmd, len, &index, &en) || index != len) {
+			log_command_result(cmd, "ERROR", "invalid enable format");
+		} else if (en != 0 && en != 1) {
+			log_command_result(cmd, "ERROR", "enable must be 0 or 1");
+		} else {
+			stepper_set_enabled(en != 0);
+			log_command_result(cmd, "OK", "");
+		}
+		break;
+	}
+	default:
+		log_command_result(cmd, "ERROR", "unknown command");
+		break;
+	}
+}
+
+/*==========================================================================
+ * Stepper motor control
+ *==========================================================================*/
+
+uint16_t speed_pct_to_arr(uint16_t pct) {
+	/* pct is %*100, range 0..10000 (0% to 100%) */
+	if (pct == 0) return ARR_MAX;
+	/* Map pct linearly: 100% → ARR_MIN, ~1% → ARR_MAX */
+	float n = MAX_SPEED_RPS * ((float)pct / 10000.0f);
+	float arr_f = (float)F_TIMER / (2.0f * n * STEPS_PER_REV) - 1.0f;
+	if (arr_f < ARR_MIN) return ARR_MIN;
+	if (arr_f > ARR_MAX) return ARR_MAX;
+	return (uint16_t)arr_f;
+}
+
+void stepper_update_motor_angle(void) {
+	stepper.motor_angle_deg = (float)stepper.current_pos * DEG_PER_MICROSTEP;
+}
+
+void stepper_set_enabled(bool en) {
+	stepper.enabled = en;
+	HAL_GPIO_WritePin(Enable_GPIO_Port, Enable_Pin, en ? GPIO_PIN_RESET : GPIO_PIN_SET);
+	if (!en) {
+		stepper.mode = MODE_IDLE;
+		stepper.steps_remaining = 0;
+		stepper.velocity_pct = 0;
+	}
+}
+
+void stepper_set_direction(int8_t dir) {
+	stepper.direction = dir;
+	HAL_GPIO_WritePin(Dir_GPIO_Port, Dir_Pin, dir > 0 ? GPIO_PIN_RESET : GPIO_PIN_SET);
+}
+
+void stepper_stop(void) {
+	stepper.mode = MODE_IDLE;
+	stepper.steps_remaining = 0;
+	stepper.velocity_pct = 0;
+}
+
+void stepper_start_velocity(int16_t pct) {
+	if (!stepper.enabled) return;
+
+	if (pct == 0) {
+		stepper_stop();
+		return;
+	}
+
+	stepper.mode = MODE_VELOCITY;
+	stepper.velocity_pct = pct;
+
+	int8_t dir = (pct > 0) ? 1 : -1;
+	stepper_set_direction(dir);
+
+	uint16_t abs_pct = (uint16_t)(pct > 0 ? pct : -pct);
+	stepper.current_arr = speed_pct_to_arr(abs_pct);
+	__HAL_TIM_SET_AUTORELOAD(&htim17, stepper.current_arr);
+}
+
+void stepper_start_position(float target_deg, uint16_t max_speed_pct) {
+	if (!stepper.enabled || !stepper.calibrated) return;
+
+	if (target_deg < ANGLE_MIN_DEG) target_deg = ANGLE_MIN_DEG;
+	if (target_deg > ANGLE_MAX_DEG) target_deg = ANGLE_MAX_DEG;
+
+	stepper.target_angle_deg = target_deg;
+
+	float delta_deg = target_deg - stepper.motor_angle_deg;
+	int32_t steps = (int32_t)(delta_deg / DEG_PER_MICROSTEP);
+
+	if (steps == 0) {
+		stepper_stop();
+		return;
+	}
+
+	stepper_set_direction(steps > 0 ? 1 : -1);
+	stepper.steps_remaining = abs(steps);
+	stepper.steps_total = stepper.steps_remaining;
+	stepper.velocity_pct = (int16_t)max_speed_pct;
+	stepper.mode = MODE_POSITION;
+
+	/* Start slow */
+	stepper.current_arr = RAMP_START_ARR;
+	__HAL_TIM_SET_AUTORELOAD(&htim17, stepper.current_arr);
+}
+
+void stepper_start_calibration(float cal_angle_deg) {
+	if (cal_angle_deg < ANGLE_MIN_DEG) cal_angle_deg = ANGLE_MIN_DEG;
+	if (cal_angle_deg > ANGLE_MAX_DEG) cal_angle_deg = ANGLE_MAX_DEG;
+
+	stepper_stop();
+	stepper.target_angle_deg = cal_angle_deg;
+	stepper.current_pos = (int32_t)(cal_angle_deg / DEG_PER_MICROSTEP);
+	stepper_update_motor_angle();
+	stepper.calibrated = true;
+}
+
+/*==========================================================================
+ * Telemetry — JSON over UART
+ *==========================================================================*/
+
+void send_telemetry(void) {
+	/* Build JSON by concatenation — no library needed.
+	 * Angles in 0.01 deg (integer), velocity in %*100. */
+	const char *mode_str;
+	switch (stepper.mode) {
+		case MODE_VELOCITY:    mode_str = "V"; break;
+		case MODE_POSITION:    mode_str = "P"; break;
+		default:               mode_str = "I"; break;
+	}
+
+	int32_t motor_cdeg = (int32_t)(stepper.motor_angle_deg * 100.0f);
+	int32_t amr_cdeg = (int32_t)(stepper.amr_angle_deg * 100.0f);
+	int32_t target_cdeg = (int32_t)(stepper.target_angle_deg * 100.0f);
+
+	/* Compute steps/sec from current ARR */
+	int32_t sps = 0;
+	if (stepper.mode == MODE_VELOCITY || stepper.mode == MODE_POSITION) {
+		sps = (int32_t)(F_TIMER / (2.0f * (stepper.current_arr + 1)));
+	}
+
+	int len = snprintf(uart_tx_buf, UART_TX_BUF_SIZE,
+		"{\"mode\":\"%s\",\"motor\":%ld,\"amr\":%ld,\"target\":%ld,"
+		"\"vel\":%d,\"sps\":%ld,\"en\":%d,\"cal\":%d,\"rem\":%ld}\n",
+		mode_str, motor_cdeg, amr_cdeg, target_cdeg,
+		stepper.velocity_pct, sps,
+		stepper.enabled ? 1 : 0,
+		stepper.calibrated ? 1 : 0,
+		stepper.steps_remaining);
+
+	if (len > 0 && len < UART_TX_BUF_SIZE)
+		uart_send(uart_tx_buf);
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -302,23 +726,24 @@ int main(void)
   MX_TIM4_Init();
   MX_TIM6_Init();
   MX_TIM17_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 
   /* Initialize user-defined Peripherals ***************************************************************/
   SEGGER_RTT_Init();
   SEGGER_RTT_WriteString(0, "RTT initialized\r\n");
 
-  calibrateADCs();													// calibrate ADCs												// signal, that Sensor Unit is ready to use and check Error-Light
+  uart_send("{\"msg\":\"SuA stepper controller ready\"}\n");
+  SEGGER_RTT_WriteString(0, "USART2 initialized\r\n");
+
+  calibrateADCs();													// calibrate ADCs
 
   HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t*)adcVal, 3);		// configure ADC mode
   HAL_TIM_Base_Start_IT(&htim7);									// start timer 7
   HAL_TIM_Base_Start_IT(&htim17);
 
-  //Suspend Ticks and enter
-  HAL_PWR_EnableSleepOnExit();										// configure sleep mode
-  HAL_SuspendTick();
-  HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI); // set sleep mode
-
+  /* Motor disabled at startup */
+  stepper_set_enabled(false);
 
   /* USER CODE END 2 */
 
@@ -329,6 +754,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    uart_process_rx();
   }
   /* USER CODE END 3 */
 }
@@ -706,6 +1132,56 @@ static void MX_TIM17_Init(void)
 }
 
 /**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+  HAL_NVIC_SetPriority(USART2_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(USART2_IRQn);
+  HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
@@ -766,6 +1242,14 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+	if (huart == &huart2) {
+		uart_rx.data[uart_rx.head] = uart_rx_byte;
+		uart_rx.head = (uart_rx.head + 1) % UART_RX_BUF_SIZE;
+		HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+	}
+}
+
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc){
 
 	/*INFOBOX: (CLICK TO OPEN)
@@ -775,8 +1259,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc){
 	 * 3. then CORDIC is executing angle measurement
 	 * 4. redundancy check between both channels
 	 */
-
-	HAL_ResumeTick();							// µController wake up
 
 	ADCresult = getDMAValues(adcVal);			// save raw ADC values from DMA array into struct
 
@@ -788,11 +1270,16 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc){
   if (amr_angle_deg < 0.0f) {
     amr_angle_deg += 180.0f;
   }
+
+	stepper.amr_angle_deg = amr_angle_deg;
 	writeRTT(ADCresult, &amr_minmax, amr_angle_deg_raw, amr_angle_deg);
 
-	HAL_SuspendTick();
-
-	//sleep on exit will set Core to sleep when exit of ISR
+	/* Send telemetry at reduced rate */
+	telemetry_counter++;
+	if (telemetry_counter >= TELEMETRY_DIVISOR) {
+		telemetry_counter = 0;
+		send_telemetry();
+	}
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
@@ -803,7 +1290,55 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
 	 */
 
 	if(htim == &htim17){
-		// Enter your TIMER 17 ISR here...
+		if (!stepper.enabled) return;
+
+		if (stepper.mode == MODE_VELOCITY) {
+			/* Continuous stepping — toggle the STEP pin */
+			HAL_GPIO_TogglePin(Step_GPIO_Port, Step_Pin);
+
+			/* Count only on rising edges (every other toggle) */
+			static bool step_high = false;
+			step_high = !step_high;
+			if (step_high) {
+				stepper.current_pos += stepper.direction;
+				stepper_update_motor_angle();
+			}
+		}
+		else if (stepper.mode == MODE_POSITION && stepper.steps_remaining > 0) {
+			HAL_GPIO_TogglePin(Step_GPIO_Port, Step_Pin);
+
+			static bool pos_step_high = false;
+			pos_step_high = !pos_step_high;
+			if (pos_step_high) {
+				stepper.current_pos += stepper.direction;
+				stepper.steps_remaining--;
+				stepper_update_motor_angle();
+
+				/* Trapezoidal ramp profile */
+				int32_t steps_done = stepper.steps_total - stepper.steps_remaining;
+				uint16_t cruise_arr = speed_pct_to_arr((uint16_t)abs(stepper.velocity_pct));
+
+				if (stepper.steps_total < RAMP_MIN_STEPS) {
+					/* Short move — just go slow */
+					stepper.current_arr = RAMP_START_ARR;
+				} else if (steps_done < RAMP_ACCEL_STEPS) {
+					/* Accelerating */
+					float frac = (float)steps_done / RAMP_ACCEL_STEPS;
+					stepper.current_arr = (uint16_t)(RAMP_START_ARR - frac * (RAMP_START_ARR - cruise_arr));
+				} else if (stepper.steps_remaining < RAMP_ACCEL_STEPS) {
+					/* Decelerating */
+					float frac = (float)stepper.steps_remaining / RAMP_ACCEL_STEPS;
+					stepper.current_arr = (uint16_t)(RAMP_START_ARR - frac * (RAMP_START_ARR - cruise_arr));
+				} else {
+					stepper.current_arr = cruise_arr;
+				}
+				__HAL_TIM_SET_AUTORELOAD(&htim17, stepper.current_arr);
+
+				if (stepper.steps_remaining == 0) {
+					stepper_stop();
+				}
+			}
+		}
 	}
 
 	if (htim == &htim4){
