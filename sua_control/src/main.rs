@@ -160,7 +160,7 @@ impl SuaApp {
                 let pct = (v as f64 * 100.0).clamp(-100.0, 100.0);
                 if (pct - self.velocity_pct).abs() > 0.5 {
                     self.velocity_pct = pct;
-                    let vel_cmd = (pct * 100.0) as i16;
+                    let vel_cmd = (pct * 10.0) as i16;
                     self.send_command(Command::Velocity(vel_cmd));
                 }
             }
